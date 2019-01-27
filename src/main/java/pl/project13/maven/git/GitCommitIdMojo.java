@@ -17,23 +17,11 @@
 
 package pl.project13.maven.git;
 
-import java.io.Closeable;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
-import java.text.SimpleDateFormat;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.regex.Pattern;
-
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.io.Closeables;
+import com.google.common.io.Files;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -43,19 +31,22 @@ import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.io.Closeables;
-import com.google.common.io.Files;
-import java.io.OutputStream;
-
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
 import pl.project13.maven.git.build.BuildServerDataProvider;
 import pl.project13.maven.git.log.LoggerBridge;
 import pl.project13.maven.git.log.MavenLoggerBridge;
 import pl.project13.maven.git.util.PropertyManager;
 import pl.project13.maven.git.util.SortedProperties;
+
+import java.io.*;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.regex.Pattern;
 
 /**
  * Puts git build-time information into property files or maven's properties.
@@ -544,79 +535,96 @@ public class GitCommitIdMojo extends AbstractMojo {
     jGitProvider.loadGitData(evaluateOnCommit, properties);
   }
 
-  void maybeGeneratePropertiesFile(@NotNull Properties localProperties, File base, String propertiesFilename) throws GitCommitIdExecutionException {
-    try {
-      final File gitPropsFile = craftPropertiesOutputFile(base, propertiesFilename);
-      final boolean isJsonFormat = "json".equalsIgnoreCase(format);
-
-      boolean shouldGenerate = true;
-
-      if (gitPropsFile.exists()) {
-        final Properties persistedProperties;
-
+    void maybeGeneratePropertiesFile(@NotNull Properties localProperties, File base, String propertiesFilename) throws GitCommitIdExecutionException {
         try {
-          if (isJsonFormat) {
-            log.info("Reading existing json file [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
+            final File gitPropsFile = craftPropertiesOutputFile(base, propertiesFilename);
+            String formatLowerCase = format == null || format.isEmpty() ? "" : format.toLowerCase();
+            boolean shouldGenerate = true;
 
-            persistedProperties = readJsonProperties(gitPropsFile);
-          } else {
-            log.info("Reading existing properties file [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
+            if (gitPropsFile.exists()) {
+                final Properties persistedProperties;
 
-            persistedProperties = readProperties(gitPropsFile);
-          }
+                try {
 
-          final Properties propertiesCopy = (Properties) localProperties.clone();
+                    switch (formatLowerCase) {
+                        case "json":
+                            log.info("Reading existing json file [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
 
-          final String buildTimeProperty = prefixDot + GitCommitPropertyConstant.BUILD_TIME;
+                            persistedProperties = readJsonProperties(gitPropsFile);
+                            break;
+                        case "html":
+                            log.info("Reading existing html file [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
 
-          propertiesCopy.remove(buildTimeProperty);
-          persistedProperties.remove(buildTimeProperty);
+                            persistedProperties = readHtmlProperties(gitPropsFile);
+                            break;
+                        default:
+                            log.info("Reading existing properties file [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
 
-          shouldGenerate = !propertiesCopy.equals(persistedProperties);
-        } catch (CannotReadFileException ex) {
-          // Read has failed, regenerate file
-          log.info("Cannot read properties file [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
-          shouldGenerate = true;
+                            persistedProperties = readProperties(gitPropsFile);
+
+                    }
+
+                    final Properties propertiesCopy = (Properties) localProperties.clone();
+
+                    final String buildTimeProperty = prefixDot + GitCommitPropertyConstant.BUILD_TIME;
+
+                    propertiesCopy.remove(buildTimeProperty);
+                    persistedProperties.remove(buildTimeProperty);
+
+                    shouldGenerate = !propertiesCopy.equals(persistedProperties);
+                } catch (CannotReadFileException ex) {
+                    // Read has failed, regenerate file
+                    log.info("Cannot read properties file [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
+                    shouldGenerate = true;
+                }
+            }
+
+            if (shouldGenerate) {
+                Files.createParentDirs(gitPropsFile);
+                Writer outputWriter = null;
+                OutputStream outputStream = null;
+                boolean threw = true;
+
+                try {
+                    outputStream = new FileOutputStream(gitPropsFile);
+                    SortedProperties sortedLocalProperties = new SortedProperties();
+                    sortedLocalProperties.putAll(localProperties);
+                    switch (formatLowerCase) {
+                        case "json":
+                            outputWriter = new OutputStreamWriter(outputStream, sourceCharset);
+                            log.info("Writing json file to [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
+                            ObjectMapper mapper = new ObjectMapper();
+                            mapper.writerWithDefaultPrettyPrinter().writeValue(outputWriter, sortedLocalProperties);
+                            break;
+                        case "html":
+                            log.info("Writing html file to [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
+                            outputWriter = new OutputStreamWriter(outputStream, sourceCharset);
+                            outputWriter.write(TableGenerator.propertiesToHtmlTable(properties));
+                            break;
+                        default:
+                            log.info("Writing properties file to [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
+                            // using outputStream directly instead of outputWriter this way the UTF-8 characters appears in unicode escaped form
+                            sortedLocalProperties.store(outputStream, "Generated by Git-Commit-Id-Plugin");
+                    }
+                    threw = false;
+                } catch (final IOException ex) {
+                    throw new RuntimeException("Cannot create custom git properties file: " + gitPropsFile, ex);
+                } finally {
+                    if (outputWriter == null) {
+                        Closeables.close(outputStream, threw);
+                    } else {
+                        Closeables.close(outputWriter, threw);
+                    }
+                }
+
+            } else {
+                log.info("Properties file [{}] is up-to-date (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
+            }
+
+        } catch (IOException e) {
+            throw new GitCommitIdExecutionException(e);
         }
-      }
-
-      if (shouldGenerate) {
-        Files.createParentDirs(gitPropsFile);
-        Writer outputWriter = null;
-        OutputStream outputStream = null;
-        boolean threw = true;
-
-        try {
-          outputStream = new FileOutputStream(gitPropsFile);
-          SortedProperties sortedLocalProperties = new SortedProperties();
-          sortedLocalProperties.putAll(localProperties);
-          if (isJsonFormat) {
-            outputWriter = new OutputStreamWriter(outputStream, sourceCharset);
-            log.info("Writing json file to [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
-            ObjectMapper mapper = new ObjectMapper();
-            mapper.writerWithDefaultPrettyPrinter().writeValue(outputWriter, sortedLocalProperties);
-          } else {
-            log.info("Writing properties file to [{}] (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
-            // using outputStream directly instead of outputWriter this way the UTF-8 characters appears in unicode escaped form
-            sortedLocalProperties.store(outputStream, "Generated by Git-Commit-Id-Plugin");
-          }
-          threw = false;
-        } catch (final IOException ex) {
-          throw new RuntimeException("Cannot create custom git properties file: " + gitPropsFile, ex);
-        } finally {
-          if (outputWriter == null) {
-            Closeables.close(outputStream, threw);
-          } else {
-            Closeables.close(outputWriter, threw);
-          }
-        }
-      } else {
-        log.info("Properties file [{}] is up-to-date (for module {})...", gitPropsFile.getAbsolutePath(), project.getName());
-      }
-    } catch (IOException e) {
-      throw new GitCommitIdExecutionException(e);
     }
-  }
 
   @VisibleForTesting File craftPropertiesOutputFile(File base, String propertiesFilename) {
     File returnPath = new File(base, propertiesFilename);
@@ -680,6 +688,48 @@ public class GitCommitIdMojo extends AbstractMojo {
 
     return retVal;
   }
+
+    public Properties readHtmlProperties(@NotNull File htmlFile) throws CannotReadFileException {
+
+        final Map<String, String> tableProperties;
+
+        try {
+            tableProperties = new HashMap<>();
+            int index = 0;
+            Document doc = Jsoup.parse(htmlFile, sourceCharset.name());
+            Elements table = doc.select("table");
+
+            String key;
+            String value;
+            List<String> tdValues;
+
+            for (Element elementTr : table.select("tr")) {
+                index++;
+                if (index == 1) continue; //skip header
+                Elements tds = elementTr.select("td");
+                tdValues = new ArrayList<>();
+                for (Element element : tds) {
+                    tdValues.add(element.text());
+                }
+                if (tdValues.size() != 2) throw new IllegalArgumentException("Not supported table");
+
+                key = tdValues.get(0);
+                value = tdValues.get(1);
+
+                tableProperties.put(key, value);
+            }
+        } catch (final IOException io) {
+            throw new CannotReadFileException(io);
+        }
+
+        final Properties retVal = new Properties();
+
+        for (final Map.Entry<String, String> entry : tableProperties.entrySet()) {
+            retVal.setProperty(entry.getKey(), entry.getValue());
+        }
+
+        return retVal;
+    }
 
   @SuppressWarnings("resource")
   private Properties readProperties(@NotNull File propertiesFile) throws CannotReadFileException {
